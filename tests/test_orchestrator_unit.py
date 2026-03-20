@@ -417,10 +417,11 @@ def test_main_runs_discovery_when_key_present(
     assert exc.value.code == 2
 
 
+@patch("orchestrator.random.choice", side_effect=lambda seq: seq[0])
 @patch("orchestrator.run_one_repo", return_value=False)
 @patch("orchestrator.discover_repos_for_run")
 def test_main_runs_only_first_repo(
-    mock_disc: MagicMock, mock_run: MagicMock, monkeypatch: pytest.MonkeyPatch
+    mock_disc: MagicMock, mock_run: MagicMock, _choice: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CURSOR_API_KEY", "x")
     monkeypatch.setenv("IYNX_PROGRESS_JSONL", "")

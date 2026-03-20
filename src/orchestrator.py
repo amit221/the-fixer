@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import shlex
 import shutil
 import stat
@@ -1097,8 +1098,8 @@ def main() -> None:
         )
         sys.exit(2)
 
-    repo = repos[0]
-    logger.info("Selected %s (first of %d qualifying)", repo.full_name, len(repos))
+    repo = random.choice(repos)
+    logger.info("Selected %s (random of %d qualifying)", repo.full_name, len(repos))
     success_count = 1 if run_one_repo(repo, progress=pw) else 0
     logger.info("Done. %d PR(s) created.", success_count)
     _notify_progress(

@@ -180,7 +180,7 @@ iynx/
 ## Flow
 
 1. **Discovery**: Search GitHub (defaults in `orchestrator.py`: e.g. stars, repo age, pool size), then keep repos that have a CONTRIBUTING file and none of your prior PRs to that repo.
-2. **Pick one repo**: The **first** repo in that filtered list is the only one processed this run.
+2. **Pick one repo**: One repo is chosen **uniformly at random** from the filtered list (so repeated runs are not stuck on the same top search hit).
 3. **Issue preflight** (host, GitHub API): Require at least one **open** issue (PRs excluded). If none, skip **without cloning**. This only checks that the list is non-empty.
 4. **Clone**: `git clone` inside Docker into `workspace/owner-repo/`.
 5. **Bootstrap**: Generate `iynx.cursor-agent` from repo structure (Node/Python/Rust).
