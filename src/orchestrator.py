@@ -39,7 +39,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE = PROJECT_ROOT / "workspace"
 SKILLS_DIR = PROJECT_ROOT / "skills"
 DOCKER_IMAGE = "iynx-agent:latest"
-DOCKER_RUN_TIMEOUT = 600.0
+# Monorepo installs + agent work often exceed 10 minutes; override with IYNX_DOCKER_RUN_TIMEOUT (seconds).
+DOCKER_RUN_TIMEOUT = 3600.0
 
 # Discovery defaults (change here; no env vars).
 DISCOVERY_POOL_SIZE = 100
@@ -53,11 +54,125 @@ SKIP_REPOS_WITH_USER_PRS = True
 
 CURSOR_AGENT_MODEL = "composer-2"
 
+
+def _docker_run_timeout_seconds() -> float:
+    """Host-side cap for each `docker run` (clone, cursor phases, etc.)."""
+    raw = (os.environ.get("IYNX_DOCKER_RUN_TIMEOUT") or "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            logger.warning("Invalid IYNX_DOCKER_RUN_TIMEOUT %r; using %.0fs", raw, DOCKER_RUN_TIMEOUT)
+    return DOCKER_RUN_TIMEOUT
+
+
+def _cursor_agent_model() -> str:
+    """CLI `--model`; env IYNX_CURSOR_MODEL overrides module default."""
+    m = (os.environ.get("IYNX_CURSOR_MODEL") or "").strip()
+    return m if m else CURSOR_AGENT_MODEL
+
+
+def _cursor_permissive_cli_flags() -> list[str]:
+    """
+    Headless Docker runs should not block on per-command approval.
+
+    Uses Cursor Agent flags from CLI docs: --yolo (--force alias), --approve-mcps,
+    --sandbox disabled. Opt out with IYNX_CURSOR_PERMISSIVE=0.
+    """
+    raw = (os.environ.get("IYNX_CURSOR_PERMISSIVE") or "1").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return []
+    return ["--yolo", "--approve-mcps", "--sandbox", "disabled"]
+
+
+def _cursor_extra_cli_args() -> list[str]:
+    """Optional extra cursor-agent args, shell-quoted later (posix shlex)."""
+    extra = (os.environ.get("IYNX_CURSOR_EXTRA_ARGS") or "").strip()
+    if not extra:
+        return []
+    return shlex.split(extra, posix=True)
+
 # If True, Docker re-runs test_command from .iynx/context.json after the fix.
 VERIFY_TESTS_AFTER_FIX = False
 
 # Optional: IYNX_TARGET_REPO=owner/name (or https://github.com/owner/repo) and IYNX_TARGET_ISSUE=N
 logger = logging.getLogger(__name__)
+
+
+def _docker_allocate_tty() -> bool:
+    """
+    When True, `docker run` gets `-t` so the container process has a pseudo-TTY.
+    Without a TTY, many CLIs (Node, etc.) fully buffer stdout when piped, so the host
+    sees no [docker] lines until the buffer fills or the process exits.
+    """
+    raw = os.environ.get("IYNX_DOCKER_TTY", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _docker_trace_enabled() -> bool:
+    """Extra `[iynx-docker]` timestamp lines inside container shells (default on)."""
+    raw = (os.environ.get("IYNX_DOCKER_TRACE") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _docker_xtrace_enabled() -> bool:
+    """When True, container bash snippets run with `set -x` (very noisy)."""
+    raw = (os.environ.get("IYNX_DOCKER_XTRACE") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _docker_trace_helpers() -> str:
+    """
+    Bash prefix for Docker-run scripts: defines _iynx_log (real or no-op).
+    Lines go to stdout so the host's [docker] stream shows them.
+    """
+    if not _docker_trace_enabled():
+        return "_iynx_log() { :; }\n"
+    lines: list[str] = []
+    if _docker_xtrace_enabled():
+        lines.append("set -x")
+    lines.extend(
+        [
+            r"_iynx_ts() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }",
+            r'_iynx_log() { printf "%s\n" "[iynx-docker] $(_iynx_ts) $*"; }',
+            r'_iynx_log "shell_start pid=$$ pwd=$(pwd) user=$(id -un 2>/dev/null || echo ?)"',
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _flush_logging_handlers() -> None:
+    """Push streamed docker lines to the console immediately (StreamHandler buffers)."""
+    for handler in logging.root.handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+
+
+def _cursor_print_output_flags() -> list[str]:
+    """
+    Flags for `cursor-agent --print` so stdout is useful while the agent runs.
+
+    Per Cursor CLI docs: `text` only prints the final answer; `stream-json` emits
+    NDJSON events as the session progresses; `--stream-partial-output` adds
+    smaller text deltas (only valid with stream-json).
+
+    Env:
+      IYNX_CURSOR_OUTPUT_FORMAT — text | json | stream-json (default: stream-json)
+      IYNX_CURSOR_STREAM_PARTIAL — 1/0; when 1 and format is stream-json, pass
+        --stream-partial-output (default: 1)
+    """
+    fmt = (os.environ.get("IYNX_CURSOR_OUTPUT_FORMAT") or "stream-json").strip().lower()
+    if fmt not in ("text", "json", "stream-json"):
+        logger.warning("Unknown IYNX_CURSOR_OUTPUT_FORMAT %r; using stream-json", fmt)
+        fmt = "stream-json"
+    flags: list[str] = ["--output-format", fmt]
+    if fmt == "stream-json":
+        raw = (os.environ.get("IYNX_CURSOR_STREAM_PARTIAL") or "1").strip().lower()
+        if raw not in ("0", "false", "no", "off"):
+            flags.append("--stream-partial-output")
+    return flags
 
 
 def _notify_progress(
@@ -258,9 +373,19 @@ def _maybe_verify_tests(dest: Path) -> bool:
     iynx = dest / ".iynx"
     iynx.mkdir(parents=True, exist_ok=True)
     script = iynx / "verify-tests.sh"
+    helpers = _docker_trace_helpers()
     script.write_text(
-        "#!/usr/bin/env bash\nset -euo pipefail\ncd /home/dev/workspace\n" + cmd.strip() + "\n",
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"{helpers}"
+        '_iynx_log "verify_tests: cwd=$(pwd) starting"\n'
+        "cd /home/dev/workspace\n"
+        '_iynx_log "verify_tests: running test_command from context.json"\n'
+        + cmd.strip()
+        + "\n"
+        '_iynx_log "verify_tests: success"\n',
         encoding="utf-8",
+        newline="\n",
     )
     try:
         script.chmod(0o755)
@@ -313,7 +438,7 @@ def _remove_workspace_dir(path: Path) -> None:
 
 
 def _docker_run_stream(
-    cmd: list[str], timeout: float = DOCKER_RUN_TIMEOUT
+    cmd: list[str], timeout: float | None = None
 ) -> subprocess.CompletedProcess:
     """Run docker with merged stdout/stderr streamed to the host logger line-by-line."""
     lines: list[str] = []
@@ -337,9 +462,12 @@ def _docker_run_stream(
                 lines.append(line)
                 if line:
                     logger.info("[docker] %s", line)
+                    _flush_logging_handlers()
         except Exception:
             pass
 
+    if timeout is None:
+        timeout = _docker_run_timeout_seconds()
     reader = threading.Thread(target=_drain, daemon=True)
     reader.start()
     try:
@@ -376,6 +504,8 @@ def _docker_run(
     line is logged as INFO with an ``[docker]`` prefix so long Cursor phases stay visible.
     """
     cmd = ["docker", "run", "--rm"]
+    if stream_logs and _docker_allocate_tty():
+        cmd.append("-t")
     if entrypoint:
         cmd.extend(["--entrypoint", entrypoint])
     if mount:
@@ -388,14 +518,14 @@ def _docker_run(
     cmd.append(DOCKER_IMAGE)
     cmd.extend(args)
     if stream_logs:
-        return _docker_run_stream(cmd, timeout=DOCKER_RUN_TIMEOUT)
+        return _docker_run_stream(cmd)
     return subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=DOCKER_RUN_TIMEOUT,
+        timeout=_docker_run_timeout_seconds(),
     )
 
 
@@ -407,21 +537,21 @@ def clone_repo(repo: RepoInfo) -> Path:
     _remove_workspace_dir(dest)
     dest.mkdir(parents=True, exist_ok=True)
 
+    helpers = _docker_trace_helpers()
+    br = shlex.quote(repo.default_branch)
+    url = shlex.quote(repo.clone_url)
+    clone_script = (
+        f"{helpers}"
+        f'_iynx_log "git_clone branch={shlex.quote(repo.default_branch)} url={shlex.quote(repo.clone_url)}"\n'
+        f"exec git clone --progress --depth 1 --branch {br} {url} /home/dev/workspace\n"
+    )
     # Clone inside container; mount empty dir, clone into it (never run git on host)
     result = _docker_run(
-        [
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            repo.default_branch,
-            repo.clone_url,
-            "/home/dev/workspace",
-        ],
+        ["-c", clone_script],
         env={"GIT_TERMINAL_PROMPT": "0"},
         mount=f"{dest.absolute()}:/home/dev/workspace",
         workdir="/home/dev/workspace",
-        entrypoint="git",
+        entrypoint="bash",
     )
     if result.returncode != 0:
         raise RuntimeError(f"git clone failed: {result.stderr or result.stdout}")
@@ -437,21 +567,54 @@ def run_cursor_phase(
     """
     Run Cursor CLI in container with workspace mounted.
     Optionally run bootstrap first.
+
+    Uses stream-json + partial output by default so merged docker stdout shows
+    live agent/tool progress (see _cursor_print_output_flags).
     """
     env = {
         "CURSOR_API_KEY": os.environ.get("CURSOR_API_KEY"),
         "GH_TOKEN": os.environ.get("GITHUB_TOKEN"),
         "GITHUB_TOKEN": os.environ.get("GITHUB_TOKEN"),
     }
-    args = ["-p", "--output-format", "text", "--trust"]
-    args.extend(["--model", CURSOR_AGENT_MODEL])
-    if force:
+    perm = _cursor_permissive_cli_flags()
+    args = [
+        "-p",
+        *_cursor_print_output_flags(),
+        "--trust",
+        "--model",
+        _cursor_agent_model(),
+        *perm,
+        *_cursor_extra_cli_args(),
+    ]
+    if force and not perm:
         args.append("--force")
     args.append(prompt)
 
     # Run bootstrap then agent (bootstrap installs deps; agent does the work)
     quoted = " ".join(shlex.quote(a) for a in args)
-    bootstrap_cmd = f"bash iynx.cursor-agent 2>/dev/null; cursor-agent {quoted}"
+    helpers = _docker_trace_helpers()
+    bootstrap_cmd = (
+        f"{helpers}"
+        f"set +e\n"
+        f'_iynx_log "cursor_phase: tool_check $(command -v cursor-agent 2>/dev/null || echo missing)"\n'
+        f'_iynx_log "cursor_phase: cursor-agent --version: $(cursor-agent --version 2>&1 | head -n 3 | tr "\\n" " ")"\n'
+        f'_iynx_log "cursor_phase: bootstrap file check"\n'
+        f"if [ -f iynx.cursor-agent ]; then\n"
+        f'  _iynx_log "cursor_phase: running iynx.cursor-agent (stdout+stderr follow)"\n'
+        f"  bash iynx.cursor-agent\n"
+        f"  _bs=$?\n"
+        f'  _iynx_log "cursor_phase: bootstrap finished exit_code=$_bs"\n'
+        f"else\n"
+        f'  _iynx_log "cursor_phase: no iynx.cursor-agent, skipping bootstrap"\n'
+        f"fi\n"
+        f'_iynx_log "cursor_phase: starting cursor-agent"\n'
+        f"set +e\n"
+        f"cursor-agent {quoted}\n"
+        f"_ca=$?\n"
+        f"set -e\n"
+        f'_iynx_log "cursor_phase: cursor-agent finished exit_code=$_ca"\n'
+        f"exit $_ca\n"
+    )
     return _docker_run(
         ["-c", bootstrap_cmd],
         env=env,
@@ -775,16 +938,30 @@ Do not commit this file.
             pr_title_q = shlex.quote(pr_title)
             upstream_url = f"https://github.com/{repo.owner}/{repo.name}.git"
             qu = shlex.quote(upstream_url)
-            pr_script = f"""cd /home/dev/workspace && \
-gh auth setup-git && \
-(git checkout -b {qb} 2>/dev/null || git checkout {qb}) && \
-(gh repo fork --remote=false || true) && \
-LOGIN=$(gh api user -q .login) && \
-git remote set-url origin "https://github.com/${{LOGIN}}/{repo.name}.git" && \
-(git remote set-url upstream {qu} 2>/dev/null || git remote add upstream {qu}) && \
-git push -u origin {qb} && \
-gh pr create --repo {shlex.quote(repo.full_name)} --title {pr_title_q} --body-file /home/dev/workspace/.iynx/pr-body.md --base {shlex.quote(repo.default_branch)} --head "${{LOGIN}}:{branch}"
-"""
+            pr_helpers = _docker_trace_helpers()
+            pr_script = (
+                f"{pr_helpers}"
+                "set -euo pipefail\n"
+                '_iynx_log "pr_create: cd /home/dev/workspace"\n'
+                "cd /home/dev/workspace\n"
+                '_iynx_log "pr_create: gh auth setup-git"\n'
+                "gh auth setup-git\n"
+                '_iynx_log "pr_create: git checkout"\n'
+                f"(git checkout -b {qb} 2>/dev/null || git checkout {qb})\n"
+                '_iynx_log "pr_create: gh repo fork"\n'
+                "(gh repo fork --remote=false || true)\n"
+                '_iynx_log "pr_create: gh api user"\n'
+                "LOGIN=$(gh api user -q .login)\n"
+                '_iynx_log "pr_create: login=$LOGIN"\n'
+                f'git remote set-url origin "https://github.com/${{LOGIN}}/{repo.name}.git"\n'
+                f"(git remote set-url upstream {qu} 2>/dev/null || git remote add upstream {qu})\n"
+                '_iynx_log "pr_create: git push"\n'
+                f"git push -u origin {qb}\n"
+                '_iynx_log "pr_create: gh pr create"\n'
+                f"gh pr create --repo {shlex.quote(repo.full_name)} --title {pr_title_q} "
+                f"--body-file /home/dev/workspace/.iynx/pr-body.md --base {shlex.quote(repo.default_branch)} "
+                f'--head "${{LOGIN}}:{branch}"\n'
+            )
             _notify_progress(progress, repo.full_name, "pr_create", "started", issue=issue_num)
             r5 = _docker_run(
                 ["-c", pr_script],
@@ -814,7 +991,12 @@ gh pr create --repo {shlex.quote(repo.full_name)} --title {pr_title_q} --body-fi
             return True
 
         except subprocess.TimeoutExpired as e:
-            logger.error("Timeout processing %s: %s", repo.full_name, e)
+            logger.error(
+                "Timeout processing %s after %ss (docker/cursor); "
+                "increase DOCKER_RUN_TIMEOUT in orchestrator.py if the run needs more time",
+                repo.full_name,
+                e.timeout,
+            )
             _notify_progress(progress, repo.full_name, "workflow", "failed", detail="timeout")
             if attempt < max_retries - 1:
                 continue

@@ -20,6 +20,20 @@ When the user names a repo, treat it as the work target before picking an issue 
 
 If no repo is given, assume the current workspace root or ask once for `owner/repo` / URL / path.
 
+## Run status (supervising agents)
+
+Long Iynx runs (`python run.py`) stream work through Docker and Cursor. A supervising agent or host process should **not** assume instant completion.
+
+**Cadence:** Use a **scheduler (or timer) that checks run status every 60 seconds** until the run finishes or the user stops it. Sixty seconds is the default interval unless the user specifies another.
+
+**What to check**
+
+- **Progress file:** `.iynx-run-progress.jsonl` at the Iynx project root (or the path in `IYNX_PROGRESS_JSONL` if set). Each line is one JSON event: `phase`, `status`, `repo`, `issue`, `detail`, `exit_code`.
+- **Done:** The run is finished when you see `phase` `run_complete` (read `detail` for `pr_created` vs `no_pr`, and `exit_code`).
+- **Between polls:** You can still read the latest line or tail new lines since the last check; avoid tight loops.
+
+**Implementation note:** The host may later ship a built-in scheduler that performs this 60s poll; until then, follow the same cadence when implementing supervision yourself.
+
 ## Quick Checklist
 
 - [ ] Pick a suitable issue

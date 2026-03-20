@@ -43,7 +43,7 @@ Then **Developer: Reload Window** so rules/skills load. Update with `git pull` i
 
 ## Prerequisites
 
-- Docker
+- Docker (the agent image runs as user `dev`, UID **1000**, so test stacks that refuse root—e.g. embedded Postgres—work after `docker build`; rebuild if you still use an older root-based image)
 - Python 3.10+
 - [Cursor CLI](https://cursor.com/docs/cli/overview) (installed in the image)
 - `CURSOR_API_KEY` (from [Cursor settings](https://cursor.com/settings))
@@ -92,6 +92,10 @@ python run.py
 
 # While Docker runs (clone, Cursor, tests, `gh`), lines from the container are streamed
 # to the console as `INFO` log lines prefixed with `[docker]`.
+# Inside the container, scripts also emit `[iynx-docker] …` timestamp lines at each phase
+# (clone, bootstrap, cursor-agent, PR) so you can follow progress; disable with IYNX_DOCKER_TRACE=0.
+# Cursor phases use `--output-format stream-json` and `--stream-partial-output` by default
+# so agent/tool progress appears as NDJSON lines (see env table to switch to `text` if logs are too noisy).
 
 # Target one repo (and optional issue number). Without argv[2], the agent lists open issues and picks one it can handle (Phase 2).
 python run.py obra/superpowers
@@ -138,8 +142,17 @@ While `python run.py` runs, the orchestrator writes **structured lifecycle event
 | `CURSOR_API_KEY` | Yes | Cursor CLI API key |
 | `GITHUB_TOKEN` | Yes* | GitHub token (repo scope) for discovery and PRs |
 | `IYNX_PROGRESS_JSONL` | No | Path to JSONL progress file; empty/`0`/`false` disables the file |
+| `IYNX_DOCKER_TTY` | No | If `1` (default), `docker run -t` for streamed steps so Cursor CLI output is line-buffered to the host; set `0` if `-t` fails (e.g. some CI) |
+| `IYNX_DOCKER_TRACE` | No | If `1` (default), every Docker shell step prints `[iynx-docker]` timestamp lines (clone, bootstrap, `cursor-agent`, verify, PR) so `docker logs` / host `[docker]` lines show clear phases; set `0` to silence |
+| `IYNX_DOCKER_XTRACE` | No | If `1`, runs those shells with `set -x` (very noisy; for deep debugging only) |
+| `IYNX_CURSOR_OUTPUT_FORMAT` | No | Cursor `--print` format: `stream-json` (default, NDJSON as the agent runs), `json`, or `text` (final answer only; quiet logs) |
+| `IYNX_CURSOR_STREAM_PARTIAL` | No | With `stream-json`, if `1` (default) passes `--stream-partial-output` for smaller text deltas; set `0` to disable |
+| `IYNX_DOCKER_RUN_TIMEOUT` | No | Max seconds per `docker run` (clone, each Cursor phase, etc.); default `3600`. Raise for huge `pnpm install` / long agent runs; lower to fail fast |
+| `IYNX_CURSOR_PERMISSIVE` | No | If `1` (default), passes `--yolo`, `--approve-mcps`, and `--sandbox disabled` to `cursor-agent` so headless runs do not stall on approvals (see [Cursor CLI parameters](https://cursor.com/docs/cli/reference/parameters)). Set `0` for stricter behavior; phases that used `--force` still append it when permissive is off |
+| `IYNX_CURSOR_MODEL` | No | Overrides the default Cursor model (`composer-2` in code) |
+| `IYNX_CURSOR_EXTRA_ARGS` | No | Extra `cursor-agent` flags (space-separated, POSIX-quoted), appended after built-in flags |
 
-Discovery rules (stars, age, pool size, CONTRIBUTING requirement, Cursor model, optional post-fix test re-run) live as **constants** in `src/orchestrator.py` — edit there to tune behavior.
+Discovery rules (stars, age, pool size, CONTRIBUTING requirement, optional post-fix test re-run) live as **constants** in `src/orchestrator.py` — edit there to tune behavior; the Cursor model default can be overridden with `IYNX_CURSOR_MODEL`.
 
 *Without `GITHUB_TOKEN`, discovery is rate-limited (60 req/hr) and PR creation will fail.
 
@@ -147,7 +160,7 @@ Discovery rules (stars, age, pool size, CONTRIBUTING requirement, Cursor model, 
 
 ```
 iynx/
-├── Dockerfile           # Cursor CLI + gh + git + jq
+├── Dockerfile           # Cursor CLI + gh + git + jq + Node.js 22; `USER dev` (UID 1000)
 ├── docker-compose.yml   # Optional local dev
 ├── src/
 │   ├── orchestrator.py  # Main loop

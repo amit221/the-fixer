@@ -61,4 +61,6 @@ def test_write_bootstrap_creates_file(tmp_path: Path) -> None:
     path = bootstrap.write_bootstrap(str(tmp_path), output_path=str(out))
     assert path == str(out)
     assert out.exists()
-    assert "pip" in out.read_text(encoding="utf-8")
+    raw = out.read_bytes()
+    assert b"\r" not in raw, "bootstrap must use LF-only newlines for Linux Docker mounts"
+    assert "pip" in raw.decode("utf-8")

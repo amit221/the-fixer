@@ -40,7 +40,8 @@ def detect_stack(repo_path: str) -> str:
 
 def _bootstrap_node() -> str:
     return """#!/usr/bin/env bash
-set -euo pipefail
+set -eu
+set -o pipefail 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 
 # Prefer lockfile for reproducible installs
@@ -58,7 +59,8 @@ fi
 
 def _bootstrap_python() -> str:
     return """#!/usr/bin/env bash
-set -euo pipefail
+set -eu
+set -o pipefail 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 
 if [ -f pyproject.toml ]; then
@@ -73,7 +75,8 @@ fi
 
 def _bootstrap_rust() -> str:
     return """#!/usr/bin/env bash
-set -euo pipefail
+set -eu
+set -o pipefail 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 
 if ! command -v cargo &>/dev/null; then
@@ -87,7 +90,8 @@ cargo fetch 2>/dev/null || cargo build 2>/dev/null || true
 
 def _bootstrap_generic() -> str:
     return """#!/usr/bin/env bash
-set -euo pipefail
+set -eu
+set -o pipefail 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 
 # Minimal bootstrap: ensure git and basic tools
@@ -132,7 +136,9 @@ def write_bootstrap(repo_path: str, output_path: str | None = None) -> str:
     content = generate_bootstrap(repo_path)
     out = Path(output_path or os.path.join(repo_path, "iynx.cursor-agent"))
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(content, encoding="utf-8")
+    # Force LF so scripts stay valid inside Linux Docker when the host is Windows
+    # (default text mode would emit CRLF and bash would reject e.g. `pipefail\r`).
+    out.write_text(content, encoding="utf-8", newline="\n")
     out.chmod(0o755)
     logger.info("Wrote bootstrap to %s (stack: %s)", out, detect_stack(repo_path))
     return str(out)

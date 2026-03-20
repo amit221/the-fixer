@@ -110,6 +110,33 @@ def test_load_skill_prompt_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert orchestrator.load_skill_prompt() == "skill-body"
 
 
+@patch("orchestrator.subprocess.Popen")
+def test_docker_run_stream_adds_tty_by_default(mock_popen: MagicMock) -> None:
+    mock_proc = MagicMock()
+    mock_proc.stdout = []
+    mock_proc.wait = MagicMock(return_value=None)
+    mock_proc.returncode = 0
+    mock_popen.return_value = mock_proc
+    orchestrator._docker_run(["echo", "hi"], entrypoint="bash")
+    cmd = mock_popen.call_args[0][0]
+    assert "-t" in cmd
+
+
+@patch("orchestrator.subprocess.Popen")
+def test_docker_run_stream_no_tty_when_disabled(
+    mock_popen: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("IYNX_DOCKER_TTY", "0")
+    mock_proc = MagicMock()
+    mock_proc.stdout = []
+    mock_proc.wait = MagicMock(return_value=None)
+    mock_proc.returncode = 0
+    mock_popen.return_value = mock_proc
+    orchestrator._docker_run(["echo", "hi"], entrypoint="bash")
+    cmd = mock_popen.call_args[0][0]
+    assert "-t" not in cmd
+
+
 @patch("orchestrator.subprocess.run")
 def test_docker_run_command_shape(mock_run: MagicMock) -> None:
     mock_run.return_value = MagicMock(returncode=0)
@@ -149,7 +176,10 @@ def test_clone_repo_success(
     dest = orchestrator.clone_repo(repo)
     assert dest == tmp_path / "o-n"
     mock_docker.assert_called_once()
-    assert "clone" in mock_docker.call_args[0][0]
+    inner = mock_docker.call_args[0][0]
+    assert inner[0] == "-c"
+    assert "git clone" in inner[1]
+    assert "--progress" in inner[1]
 
 
 @patch("orchestrator._docker_run")
@@ -302,12 +332,44 @@ def test_main_requires_cursor_key(monkeypatch: pytest.MonkeyPatch) -> None:
     assert exc.value.code == 1
 
 
+def test_cursor_print_output_flags_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("IYNX_CURSOR_OUTPUT_FORMAT", raising=False)
+    monkeypatch.delenv("IYNX_CURSOR_STREAM_PARTIAL", raising=False)
+    assert orchestrator._cursor_print_output_flags() == [
+        "--output-format",
+        "stream-json",
+        "--stream-partial-output",
+    ]
+
+
+def test_cursor_print_output_flags_text_omits_partial(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("IYNX_CURSOR_OUTPUT_FORMAT", "text")
+    assert orchestrator._cursor_print_output_flags() == ["--output-format", "text"]
+
+
+def test_cursor_print_output_flags_stream_json_partial_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("IYNX_CURSOR_OUTPUT_FORMAT", "stream-json")
+    monkeypatch.setenv("IYNX_CURSOR_STREAM_PARTIAL", "0")
+    assert orchestrator._cursor_print_output_flags() == ["--output-format", "stream-json"]
+
+
+def test_cursor_print_output_flags_invalid_falls_back(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("IYNX_CURSOR_OUTPUT_FORMAT", "bogus")
+    with caplog.at_level(logging.WARNING):
+        flags = orchestrator._cursor_print_output_flags()
+    assert flags == ["--output-format", "stream-json", "--stream-partial-output"]
+    assert any("bogus" in r.getMessage() for r in caplog.records)
+
+
 @patch("orchestrator._docker_run")
 def test_run_cursor_phase_adds_model_and_force(
     mock_docker: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CURSOR_API_KEY", "k")
     monkeypatch.setenv("GITHUB_TOKEN", "g")
+    monkeypatch.setenv("IYNX_CURSOR_PERMISSIVE", "0")
     mock_docker.return_value = MagicMock(returncode=0)
     (tmp_path / "iynx.cursor-agent").write_text("#!/bin/bash\necho\n", encoding="utf-8")
     orchestrator.run_cursor_phase(tmp_path, "do work", force=True)
@@ -319,6 +381,27 @@ def test_run_cursor_phase_adds_model_and_force(
     assert "cursor-agent" in bash_script
     assert "--force" in bash_script
     assert orchestrator.CURSOR_AGENT_MODEL in bash_script
+    assert "--output-format" in bash_script
+    assert "stream-json" in bash_script
+    assert "--stream-partial-output" in bash_script
+    assert "[iynx-docker]" in bash_script
+    assert "cursor_phase:" in bash_script
+
+
+@patch("orchestrator._docker_run")
+def test_run_cursor_phase_permissive_yolo_by_default(
+    mock_docker: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("IYNX_CURSOR_PERMISSIVE", raising=False)
+    monkeypatch.delenv("IYNX_CURSOR_EXTRA_ARGS", raising=False)
+    monkeypatch.setenv("CURSOR_API_KEY", "k")
+    mock_docker.return_value = MagicMock(returncode=0)
+    (tmp_path / "iynx.cursor-agent").write_text("#!/bin/bash\necho\n", encoding="utf-8")
+    orchestrator.run_cursor_phase(tmp_path, "hello", force=False)
+    bash_script = mock_docker.call_args[0][0][1]
+    assert "--yolo" in bash_script
+    assert "--approve-mcps" in bash_script
+    assert "--sandbox" in bash_script and "disabled" in bash_script
 
 
 @patch("orchestrator.discover_repos_for_run", return_value=[])
