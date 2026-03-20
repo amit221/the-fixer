@@ -15,3 +15,6 @@ htmlcov/
 Thumbs.db
 .idea/
 .vscode/
+
+# Superpowers plugin / workflow plans (local copies, not source of truth)
+docs/superpowers/

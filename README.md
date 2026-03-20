@@ -4,6 +4,16 @@
   <img src="lynx_logo.png" alt="Cybernetic lynx head logo in blue and teal, with circuit patterns and a code symbol in one eye." width="200" />
 </p>
 
+<p align="center">
+  <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white" alt="CI: GitHub Actions (see workflow file)" /></a>
+  <img src="https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-3776AB?logo=python&logoColor=white" alt="Python 3.10–3.12" />
+  <img src="https://img.shields.io/badge/tests-pytest-0A9EDC?logo=pytest&logoColor=white" alt="pytest" />
+  <img src="https://img.shields.io/badge/coverage-min%2078%25-31C653" alt="Coverage: minimum 78% (pytest-cov, pyproject.toml)" />
+  <img src="https://img.shields.io/badge/branch_coverage-enabled-2ea043" alt="Branch coverage enabled (coverage.py)" />
+  <img src="https://img.shields.io/badge/lint%20%2F%20format-ruff-261220?logo=ruff&logoColor=white" alt="Ruff lint and format" />
+  <img src="https://img.shields.io/badge/Docker-required-2496ED?logo=docker&logoColor=white" alt="Docker required for agent runs" />
+</p>
+
 An autonomous agent that discovers trendy GitHub repos, learns contribution guidelines, fixes issues, tests in Docker, and opens PRs. Uses **Cursor CLI** as the primary AI engine. All repo execution (clone, npm test, etc.) runs **inside Docker** for safety.
 
 ## Architecture
