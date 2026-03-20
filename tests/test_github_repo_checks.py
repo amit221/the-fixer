@@ -77,3 +77,95 @@ def test_find_first_suitable_open_issue_none_when_all_fail(mock_get: MagicMock) 
     mock_get.side_effect = requests.RequestException("nope")
     assert grc.find_first_suitable_open_issue("o", "r", "tok") is None
     assert mock_get.call_count == 1
+
+
+@patch("github_repo_checks.requests.get")
+def test_find_first_suitable_open_issue_json_not_list(mock_get: MagicMock) -> None:
+    mock_get.return_value.json.return_value = {}
+    mock_get.return_value.raise_for_status = MagicMock()
+    assert grc.find_first_suitable_open_issue("o", "r", "tok") is None
+
+
+@patch("github_repo_checks.requests.get")
+def test_find_first_suitable_open_issue_skips_non_dict_items(mock_get: MagicMock) -> None:
+    mock_get.return_value.json.return_value = ["not-a-dict", 1]
+    mock_get.return_value.raise_for_status = MagicMock()
+    assert grc.find_first_suitable_open_issue("o", "r", "tok") is None
+
+
+@patch("github_repo_checks.requests.get")
+def test_find_first_suitable_open_issue_skips_invalid_number(mock_get: MagicMock) -> None:
+    mock_get.return_value.json.return_value = [{"number": "bad"}]
+    mock_get.return_value.raise_for_status = MagicMock()
+    assert grc.find_first_suitable_open_issue("o", "r", "tok") is None
+
+
+@patch("github_repo_checks.requests.get")
+def test_validate_open_non_pr_issue_invalid_number(mock_get: MagicMock) -> None:
+    assert grc.validate_open_non_pr_issue("o", "r", 0, "tok") is None
+    mock_get.assert_not_called()
+
+
+@patch("github_repo_checks.requests.get")
+def test_validate_open_non_pr_issue_404(mock_get: MagicMock) -> None:
+    mock_get.return_value.status_code = 404
+    assert grc.validate_open_non_pr_issue("o", "r", 9, "tok") is None
+
+
+@patch("github_repo_checks.requests.get")
+def test_validate_open_non_pr_issue_closed(mock_get: MagicMock) -> None:
+    mock_get.return_value.status_code = 200
+    mock_get.return_value.json.return_value = {
+        "state": "closed",
+        "number": 9,
+    }
+    mock_get.return_value.raise_for_status = MagicMock()
+    assert grc.validate_open_non_pr_issue("o", "r", 9, "tok") is None
+
+
+@patch("github_repo_checks.requests.get")
+def test_validate_open_non_pr_issue_is_pull_request(mock_get: MagicMock) -> None:
+    mock_get.return_value.status_code = 200
+    mock_get.return_value.json.return_value = {
+        "state": "open",
+        "number": 9,
+        "pull_request": {"url": "x"},
+    }
+    mock_get.return_value.raise_for_status = MagicMock()
+    assert grc.validate_open_non_pr_issue("o", "r", 9, "tok") is None
+
+
+@patch("github_repo_checks.requests.get")
+def test_validate_open_non_pr_issue_success(mock_get: MagicMock) -> None:
+    mock_get.return_value.status_code = 200
+    mock_get.return_value.json.return_value = {
+        "state": "open",
+        "number": 42,
+    }
+    mock_get.return_value.raise_for_status = MagicMock()
+    assert grc.validate_open_non_pr_issue("o", "r", 42, "tok") == 42
+
+
+@patch("github_repo_checks.requests.get")
+def test_validate_open_non_pr_issue_request_error(mock_get: MagicMock) -> None:
+    mock_get.side_effect = requests.RequestException("down")
+    assert grc.validate_open_non_pr_issue("o", "r", 1, "tok") is None
+
+
+@patch("github_repo_checks.requests.get")
+def test_validate_open_non_pr_issue_json_not_dict(mock_get: MagicMock) -> None:
+    mock_get.return_value.status_code = 200
+    mock_get.return_value.json.return_value = []
+    mock_get.return_value.raise_for_status = MagicMock()
+    assert grc.validate_open_non_pr_issue("o", "r", 1, "tok") is None
+
+
+@patch("github_repo_checks.requests.get")
+def test_validate_open_non_pr_issue_number_not_int(mock_get: MagicMock) -> None:
+    mock_get.return_value.status_code = 200
+    mock_get.return_value.json.return_value = {
+        "state": "open",
+        "number": "1",
+    }
+    mock_get.return_value.raise_for_status = MagicMock()
+    assert grc.validate_open_non_pr_issue("o", "r", 1, "tok") is None

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -394,3 +396,236 @@ def test_run_one_repo_skips_clone_when_no_preflight_issue(
     )
     assert orchestrator.run_one_repo(repo, max_retries=1) is False
     mock_clone.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", None),
+        ("  ", None),
+        ("https://github.com/acme/proj", ("acme", "proj")),
+        ("https://github.com/acme/proj.git", ("acme", "proj")),
+        ("acme/proj", ("acme", "proj")),
+        ("acme/proj/", ("acme", "proj")),
+        ("bad", None),
+        ("a/b/c", None),
+    ],
+)
+def test_parse_owner_repo_string(raw: str, expected: tuple[str, str] | None) -> None:
+    assert orchestrator._parse_owner_repo_string(raw) == expected
+
+
+def test_parse_cli_target_repo_and_issue_no_args(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["orchestrator"])
+    pair, issue = orchestrator.parse_cli_target_repo_and_issue()
+    assert pair is None and issue is None
+
+
+def test_parse_cli_target_repo_and_issue_with_repo_and_issue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["orchestrator", "o/r", "12"])
+    pair, issue = orchestrator.parse_cli_target_repo_and_issue()
+    assert pair == ("o", "r")
+    assert issue == 12
+
+
+def test_parse_cli_target_repo_and_issue_invalid_issue_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["orchestrator", "o/r", "nope"])
+    pair, issue = orchestrator.parse_cli_target_repo_and_issue()
+    assert pair == ("o", "r")
+    assert issue is None
+
+
+@patch("orchestrator.fetch_repo_by_full_name")
+def test_resolve_target_from_env_invalid_issue(mock_fetch: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["prog"])
+    monkeypatch.setenv("IYNX_TARGET_REPO", "env/o")
+    monkeypatch.setenv("IYNX_TARGET_ISSUE", "not-int")
+    repo = RepoInfo(
+        owner="env",
+        name="o",
+        full_name="env/o",
+        clone_url="u",
+        stars=1,
+        language=None,
+        description=None,
+        default_branch="main",
+    )
+    mock_fetch.return_value = repo
+    out_repo, issue = orchestrator.resolve_target_repo_from_env_or_argv("tok")
+    assert out_repo == repo
+    assert issue is None
+
+
+@patch("orchestrator.fetch_repo_by_full_name")
+@patch("orchestrator.parse_cli_target_repo_and_issue")
+def test_resolve_target_prefers_argv_over_env(
+    mock_parse: MagicMock, mock_fetch: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("IYNX_TARGET_REPO", "ignored/ignored")
+    mock_parse.return_value = (("cli", "repo"), 7)
+    r = RepoInfo(
+        owner="cli",
+        name="repo",
+        full_name="cli/repo",
+        clone_url="u",
+        stars=1,
+        language=None,
+        description=None,
+        default_branch="main",
+    )
+    mock_fetch.return_value = r
+    out, issue = orchestrator.resolve_target_repo_from_env_or_argv("t")
+    assert out == r
+    assert issue == 7
+    mock_fetch.assert_called_once_with("cli", "repo", token="t")
+
+
+@patch("orchestrator.fetch_repo_candidates")
+@patch("orchestrator.repo_has_contributing_guide", return_value=True)
+@patch("orchestrator.user_has_pr_to_repo", return_value=False)
+@patch("orchestrator.get_token_login", return_value=None)
+def test_discover_repos_skips_pr_filter_when_login_unresolved(
+    _gl: MagicMock,
+    _pr: MagicMock,
+    _contrib: MagicMock,
+    mock_fetch: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mock_fetch.return_value = [
+        RepoInfo("a", "r0", "a/r0", "u", 1, None, None, "main"),
+    ]
+    with caplog.at_level(logging.WARNING, logger="orchestrator"):
+        out = orchestrator.discover_repos_for_run(token="tok")
+    assert len(out) == 1
+    assert any("Could not resolve GitHub login" in r.message for r in caplog.records)
+
+
+@patch("orchestrator._docker_run")
+@patch("orchestrator._maybe_verify_tests", return_value=True)
+@patch("orchestrator.run_cursor_phase")
+@patch("orchestrator.clone_repo")
+@patch("orchestrator.validate_open_non_pr_issue", return_value=42)
+def test_run_one_repo_success_with_issue_override(
+    _val: MagicMock,
+    mock_clone: MagicMock,
+    mock_phase: MagicMock,
+    _verify: MagicMock,
+    mock_docker: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(orchestrator, "WORKSPACE", tmp_path)
+    monkeypatch.setenv("GITHUB_TOKEN", "g")
+    dest = tmp_path / "o-n"
+    dest.mkdir(parents=True)
+    mock_clone.return_value = dest
+    mock_phase.return_value = MagicMock(returncode=0)
+    mock_docker.return_value = MagicMock(returncode=0)
+    repo = RepoInfo(
+        owner="o",
+        name="n",
+        full_name="o/n",
+        clone_url="https://github.com/o/n.git",
+        stars=1,
+        language=None,
+        description=None,
+        default_branch="main",
+    )
+    assert orchestrator.run_one_repo(repo, max_retries=1, issue_override=42) is True
+    assert mock_phase.call_count == 3
+    mock_docker.assert_called_once()
+
+
+@patch("orchestrator.validate_open_non_pr_issue", return_value=None)
+@patch("orchestrator.clone_repo")
+def test_run_one_repo_skips_when_issue_override_invalid(
+    mock_clone: MagicMock, _val: MagicMock
+) -> None:
+    repo = RepoInfo(
+        owner="o",
+        name="n",
+        full_name="o/n",
+        clone_url="https://github.com/o/n.git",
+        stars=1,
+        language=None,
+        description=None,
+        default_branch="main",
+    )
+    assert orchestrator.run_one_repo(repo, max_retries=1, issue_override=99) is False
+    mock_clone.assert_not_called()
+
+
+@patch("orchestrator.run_one_repo", return_value=True)
+@patch("orchestrator.resolve_target_repo_from_env_or_argv")
+def test_main_explicit_target_without_issue_override(
+    mock_resolve: MagicMock, mock_run: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURSOR_API_KEY", "k")
+    repo = RepoInfo(
+        owner="o",
+        name="n",
+        full_name="o/n",
+        clone_url="u",
+        stars=1,
+        language=None,
+        description=None,
+        default_branch="main",
+    )
+    mock_resolve.return_value = (repo, None)
+    orchestrator.main()
+    mock_run.assert_called_once_with(repo, issue_override=None)
+
+
+@patch("orchestrator.run_one_repo", return_value=False)
+@patch("orchestrator.resolve_target_repo_from_env_or_argv")
+def test_main_explicit_target_with_issue_override(
+    mock_resolve: MagicMock, mock_run: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURSOR_API_KEY", "k")
+    repo = RepoInfo(
+        owner="o",
+        name="n",
+        full_name="o/n",
+        clone_url="u",
+        stars=1,
+        language=None,
+        description=None,
+        default_branch="main",
+    )
+    mock_resolve.return_value = (repo, 5)
+    orchestrator.main()
+    mock_run.assert_called_once_with(repo, issue_override=5)
+
+
+@patch("orchestrator.shutil.rmtree")
+def test_remove_workspace_dir_posix(
+    mock_rmtree: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestrator.os, "name", "posix")
+    p = tmp_path / "ws"
+    p.mkdir()
+    orchestrator._remove_workspace_dir(p)
+    mock_rmtree.assert_called_once()
+
+
+@patch("orchestrator._docker_run")
+@patch("orchestrator.Path.chmod", side_effect=OSError("chmod"))
+def test_maybe_verify_tests_ignores_chmod_error(
+    _chmod: MagicMock,
+    mock_docker: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(orchestrator, "VERIFY_TESTS_AFTER_FIX", True)
+    d = tmp_path / "repo"
+    d.mkdir()
+    iynx = d / ".iynx"
+    iynx.mkdir()
+    (iynx / "context.json").write_text(json.dumps({"test_command": "pytest -q"}), encoding="utf-8")
+    mock_docker.return_value = MagicMock(returncode=0, stderr="", stdout="")
+    assert orchestrator._maybe_verify_tests(d) is True
+    mock_docker.assert_called_once()

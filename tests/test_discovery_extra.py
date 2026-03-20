@@ -1,5 +1,6 @@
 """Extra discovery tests (parsing, API retries)."""
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -8,6 +9,7 @@ import requests
 from discovery import (
     _parse_created_at,
     _search_repositories_page,
+    fetch_repo_by_full_name,
     fetch_repo_candidates,
     fetch_trendy_repos,
 )
@@ -96,3 +98,63 @@ def test_fetch_trendy_repos_delegates(mock_fetch: MagicMock) -> None:
     fetch_trendy_repos(token="x", limit=3, min_stars=10, max_age_days=None)
     mock_fetch.assert_called_once()
     assert mock_fetch.call_args.kwargs["pool_size"] == 3
+
+
+@patch("discovery.requests.get")
+def test_fetch_repo_by_full_name_success(mock_get: MagicMock) -> None:
+    mock_get.return_value.status_code = 200
+    mock_get.return_value.json.return_value = {
+        "owner": {"login": "acme"},
+        "name": "app",
+        "full_name": "acme/app",
+        "clone_url": "https://github.com/acme/app.git",
+        "stargazers_count": 10,
+        "language": "Python",
+        "description": "x",
+        "default_branch": "main",
+        "created_at": "2020-01-01T00:00:00Z",
+    }
+    mock_get.return_value.raise_for_status = MagicMock()
+    r = fetch_repo_by_full_name("acme", "app", token="tok")
+    assert r is not None
+    assert r.full_name == "acme/app"
+    assert r.stars == 10
+
+
+@patch("discovery.requests.get")
+def test_fetch_repo_by_full_name_404(mock_get: MagicMock) -> None:
+    mock_get.return_value.status_code = 404
+    assert fetch_repo_by_full_name("acme", "gone", token=None) is None
+
+
+@patch("discovery.requests.get")
+def test_fetch_repo_by_full_name_request_error(mock_get: MagicMock) -> None:
+    mock_get.side_effect = requests.RequestException("timeout")
+    assert fetch_repo_by_full_name("a", "b", token="t") is None
+
+
+@patch("discovery.requests.get")
+def test_fetch_repo_by_full_name_invalid_payload(mock_get: MagicMock) -> None:
+    mock_get.return_value.status_code = 200
+    mock_get.return_value.json.return_value = []
+    mock_get.return_value.raise_for_status = MagicMock()
+    assert fetch_repo_by_full_name("a", "b", token="t") is None
+
+
+@patch("discovery.requests.get")
+def test_fetch_repo_by_full_name_missing_owner(mock_get: MagicMock) -> None:
+    mock_get.return_value.status_code = 200
+    mock_get.return_value.json.return_value = {"name": "only"}
+    mock_get.return_value.raise_for_status = MagicMock()
+    assert fetch_repo_by_full_name("a", "b", token="t") is None
+
+
+@patch("discovery._search_repositories_page")
+def test_fetch_repo_candidates_warns_without_token(
+    mock_page: MagicMock, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    mock_page.return_value = {"items": []}
+    with caplog.at_level(logging.WARNING, logger="discovery"):
+        fetch_repo_candidates(token=None, pool_size=5, min_stars=1, max_age_days=None, max_pages=1)
+    assert any("GITHUB_TOKEN" in r.message for r in caplog.records)
