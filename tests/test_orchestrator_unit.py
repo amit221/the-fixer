@@ -7,7 +7,7 @@ import logging
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -327,8 +327,11 @@ def test_main_runs_discovery_when_key_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("CURSOR_API_KEY", "x")
+    monkeypatch.setenv("IYNX_PROGRESS_JSONL", "")
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    orchestrator.main()
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.main()
+    assert exc.value.code == 2
 
 
 @patch("orchestrator.run_one_repo", return_value=False)
@@ -337,13 +340,17 @@ def test_main_runs_only_first_repo(
     mock_disc: MagicMock, mock_run: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CURSOR_API_KEY", "x")
+    monkeypatch.setenv("IYNX_PROGRESS_JSONL", "")
     mock_disc.return_value = [
         RepoInfo("a", "r0", "a/r0", "u", 1, None, None, "main"),
         RepoInfo("a", "r1", "a/r1", "u", 1, None, None, "main"),
     ]
-    orchestrator.main()
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.main()
+    assert exc.value.code == 2
     mock_run.assert_called_once()
     assert mock_run.call_args[0][0].name == "r0"
+    assert mock_run.call_args.kwargs.get("progress") is not None
 
 
 @patch("orchestrator.find_first_suitable_open_issue", return_value=99)
@@ -565,6 +572,7 @@ def test_main_explicit_target_without_issue_override(
     mock_resolve: MagicMock, mock_run: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CURSOR_API_KEY", "k")
+    monkeypatch.setenv("IYNX_PROGRESS_JSONL", "")
     repo = RepoInfo(
         owner="o",
         name="n",
@@ -577,7 +585,7 @@ def test_main_explicit_target_without_issue_override(
     )
     mock_resolve.return_value = (repo, None)
     orchestrator.main()
-    mock_run.assert_called_once_with(repo, issue_override=None)
+    mock_run.assert_called_once_with(repo, issue_override=None, progress=ANY)
 
 
 @patch("orchestrator.run_one_repo", return_value=False)
@@ -586,6 +594,7 @@ def test_main_explicit_target_with_issue_override(
     mock_resolve: MagicMock, mock_run: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CURSOR_API_KEY", "k")
+    monkeypatch.setenv("IYNX_PROGRESS_JSONL", "")
     repo = RepoInfo(
         owner="o",
         name="n",
@@ -597,8 +606,10 @@ def test_main_explicit_target_with_issue_override(
         default_branch="main",
     )
     mock_resolve.return_value = (repo, 5)
-    orchestrator.main()
-    mock_run.assert_called_once_with(repo, issue_override=5)
+    with pytest.raises(SystemExit) as exc:
+        orchestrator.main()
+    assert exc.value.code == 2
+    mock_run.assert_called_once_with(repo, issue_override=5, progress=ANY)
 
 
 @patch("orchestrator.shutil.rmtree")

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 # Ensure src is on path when run as script
@@ -31,6 +32,7 @@ from github_repo_checks import (
     user_has_pr_to_repo,
     validate_open_non_pr_issue,
 )
+from workflow_progress import ProgressWriter, progress_writer_from_env
 
 # Project root (parent of src/)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +58,37 @@ VERIFY_TESTS_AFTER_FIX = False
 
 # Optional: IYNX_TARGET_REPO=owner/name (or https://github.com/owner/repo) and IYNX_TARGET_ISSUE=N
 logger = logging.getLogger(__name__)
+
+
+def _notify_progress(
+    pw: ProgressWriter | None,
+    repo_full: str | None,
+    phase: str,
+    status: str,
+    *,
+    issue: int | None = None,
+    detail: str | None = None,
+    exit_code: int | None = None,
+) -> None:
+    """Human `[iynx]` log line plus optional JSONL row for supervising agents."""
+    rf = repo_full or "-"
+    parts = [f"phase={phase}", f"status={status}", f"repo={rf}"]
+    if issue is not None:
+        parts.append(f"issue={issue}")
+    if detail:
+        parts.append(detail)
+    if exit_code is not None:
+        parts.append(f"exit_code={exit_code}")
+    logger.info("[iynx] %s", " ".join(parts))
+    if pw is not None:
+        pw.emit(
+            phase=phase,
+            status=status,
+            repo=repo_full,
+            issue=issue,
+            detail=detail,
+            exit_code=exit_code,
+        )
 
 
 def _parse_owner_repo_string(raw: str) -> tuple[str, str] | None:
@@ -439,6 +472,7 @@ def run_one_repo(
     max_retries: int = 2,
     *,
     issue_override: int | None = None,
+    progress: ProgressWriter | None = None,
 ) -> bool:
     """
     Full flow for one repo: clone, bootstrap, Cursor phases, PR.
@@ -448,6 +482,8 @@ def run_one_repo(
     If issue_override is set, that open (non-PR) issue is used. Otherwise the host
     only checks that at least one open non-PR issue exists; after clone and context
     gathering, the AI picks the issue to fix (writes .iynx/chosen-issue.json).
+
+    If ``progress`` is set, JSONL events and ``[iynx]`` logs are emitted per phase.
     """
     skill = load_skill_prompt()
     dest = None
@@ -463,8 +499,23 @@ def run_one_repo(
                 issue_override,
                 repo.full_name,
             )
+            _notify_progress(
+                progress,
+                repo.full_name,
+                "preflight",
+                "failed",
+                detail="invalid_issue_override",
+            )
             return False
         logger.info("Preflight: %s — issue #%s (override)", repo.full_name, issue_num)
+        _notify_progress(
+            progress,
+            repo.full_name,
+            "preflight",
+            "completed",
+            issue=issue_num,
+            detail="issue_override",
+        )
     else:
         issue_num = None
         if find_first_suitable_open_issue(repo.owner, repo.name, token) is None:
@@ -473,10 +524,24 @@ def run_one_repo(
                 "Pass issue number as argv[2] or set IYNX_TARGET_ISSUE.",
                 repo.full_name,
             )
+            _notify_progress(
+                progress,
+                repo.full_name,
+                "preflight",
+                "failed",
+                detail="no_open_issues",
+            )
             return False
         logger.info(
             "Preflight: %s — at least one open issue; AI will choose after context",
             repo.full_name,
+        )
+        _notify_progress(
+            progress,
+            repo.full_name,
+            "preflight",
+            "completed",
+            detail="open_issues_exist",
         )
 
     for attempt in range(max_retries):
@@ -488,7 +553,9 @@ def run_one_repo(
                 )
                 time.sleep(backoff)
             # 1. Clone (in Docker)
+            _notify_progress(progress, repo.full_name, "clone", "started")
             dest = clone_repo(repo)
+            _notify_progress(progress, repo.full_name, "clone", "completed")
             logger.info("Cloned %s to %s", repo.full_name, dest)
 
             iynx_dir = dest / ".iynx"
@@ -499,8 +566,10 @@ def run_one_repo(
             rules_dir = dest / ".cursor" / "rules"
             rules_dir.mkdir(parents=True, exist_ok=True)
             (rules_dir / "issue-fix-workflow.md").write_text(skill, encoding="utf-8")
+            _notify_progress(progress, repo.full_name, "bootstrap", "completed")
 
             # 3. Phase 1: CONTRIBUTING + structured context (agent writes .iynx/*)
+            _notify_progress(progress, repo.full_name, "phase1_context", "started")
             phase1_prompt = f"""Read CONTRIBUTING.md (or the repo's primary contribution doc). The repository has a contribution guide.
 
 Write two files under .iynx/ (create the directory if needed):
@@ -516,6 +585,16 @@ Repo: {repo.full_name}
             r1 = run_cursor_phase(dest, phase1_prompt)
             if r1.returncode != 0:
                 logger.warning("Phase 1 failed: %s", r1.stderr or r1.stdout)
+                _notify_progress(
+                    progress,
+                    repo.full_name,
+                    "phase1_context",
+                    "failed",
+                    exit_code=r1.returncode,
+                    detail="cursor_phase",
+                )
+            else:
+                _notify_progress(progress, repo.full_name, "phase1_context", "completed")
 
             if issue_num is None:
                 qrepo = shlex.quote(repo.full_name)
@@ -540,15 +619,33 @@ If none are appropriate:
 
 Do not commit this file.
 """
+                _notify_progress(progress, repo.full_name, "phase2_issue_pick", "started")
                 r2 = run_cursor_phase(dest, phase2_prompt, force=True)
                 if r2.returncode != 0:
                     logger.warning(
                         "Phase 2 (issue selection) failed: %s", r2.stderr or r2.stdout
                     )
+                    _notify_progress(
+                        progress,
+                        repo.full_name,
+                        "phase2_issue_pick",
+                        "failed",
+                        exit_code=r2.returncode,
+                        detail="cursor_phase",
+                    )
+                else:
+                    _notify_progress(progress, repo.full_name, "phase2_issue_pick", "completed")
                 picked, pick_reason = load_chosen_issue(iynx_dir)
                 if picked is None:
                     extra = pick_reason or "No valid selection in .iynx/chosen-issue.json."
                     logger.warning("No issue selected for %s — %s", repo.full_name, extra)
+                    _notify_progress(
+                        progress,
+                        repo.full_name,
+                        "phase2_issue_pick",
+                        "failed",
+                        detail="no_issue_selected",
+                    )
                     return False
                 validated = validate_open_non_pr_issue(
                     repo.owner, repo.name, picked, token
@@ -558,6 +655,13 @@ Do not commit this file.
                         "AI picked #%s but it is not an open issue on %s; aborting",
                         picked,
                         repo.full_name,
+                    )
+                    _notify_progress(
+                        progress,
+                        repo.full_name,
+                        "phase2_issue_pick",
+                        "failed",
+                        detail="invalid_pick",
                     )
                     return False
                 issue_num = validated
@@ -587,18 +691,60 @@ Steps:
 
 Create branch fix/issue-{issue_num} before committing.
 """
+            _notify_progress(
+                progress, repo.full_name, "phase3_implement", "started", issue=issue_num
+            )
             r3 = run_cursor_phase(dest, phase3_prompt, force=True)
             if r3.returncode != 0:
                 logger.warning("Phase 3 failed: %s", r3.stderr or r3.stdout)
+                _notify_progress(
+                    progress,
+                    repo.full_name,
+                    "phase3_implement",
+                    "failed",
+                    issue=issue_num,
+                    exit_code=r3.returncode,
+                    detail="cursor_phase",
+                )
                 if attempt < max_retries - 1:
                     continue
                 return False
+            _notify_progress(
+                progress, repo.full_name, "phase3_implement", "completed", issue=issue_num
+            )
 
-            if not _maybe_verify_tests(dest):
+            if not VERIFY_TESTS_AFTER_FIX:
+                _notify_progress(
+                    progress,
+                    repo.full_name,
+                    "verify_tests",
+                    "skipped",
+                    issue=issue_num,
+                    detail="verify_disabled",
+                )
+            elif not _maybe_verify_tests(dest):
                 logger.warning("Post-fix test verification failed; skipping PR")
+                _notify_progress(
+                    progress,
+                    repo.full_name,
+                    "verify_tests",
+                    "failed",
+                    issue=issue_num,
+                )
                 return False
+            else:
+                _notify_progress(
+                    progress,
+                    repo.full_name,
+                    "verify_tests",
+                    "completed",
+                    issue=issue_num,
+                )
 
             # 5. Phase 4: PR title/body JSON
+            _notify_progress(
+                progress, repo.full_name, "phase4_pr_draft", "started", issue=issue_num
+            )
             phase4_prompt = f"""Read .iynx/summary.md, gh issue view {issue_num}, and the latest commit message/diff.
 Write ONLY valid JSON to .iynx/pr-draft.json (no markdown fence) with keys "title" and "body".
 The PR must follow repository PR conventions from the summary. Body should include: summary of changes, how to test, and a line "Fixes #{issue_num}".
@@ -607,6 +753,23 @@ Do not commit this file.
             r4 = run_cursor_phase(dest, phase4_prompt, force=True)
             if r4.returncode != 0:
                 logger.warning("Phase 4 failed: %s", r4.stderr or r4.stdout)
+                _notify_progress(
+                    progress,
+                    repo.full_name,
+                    "phase4_pr_draft",
+                    "failed",
+                    issue=issue_num,
+                    exit_code=r4.returncode,
+                    detail="cursor_phase",
+                )
+            else:
+                _notify_progress(
+                    progress,
+                    repo.full_name,
+                    "phase4_pr_draft",
+                    "completed",
+                    issue=issue_num,
+                )
 
             branch = f"fix/issue-{issue_num}"
             pr_title, pr_body = load_pr_draft(iynx_dir, issue_num)
@@ -626,6 +789,9 @@ git remote set-url origin "https://github.com/${{LOGIN}}/{repo.name}.git" && \
 git push -u origin {qb} && \
 gh pr create --repo {shlex.quote(repo.full_name)} --title {pr_title_q} --body-file /home/dev/workspace/.iynx/pr-body.md --base {shlex.quote(repo.default_branch)} --head "${{LOGIN}}:{branch}"
 """
+            _notify_progress(
+                progress, repo.full_name, "pr_create", "started", issue=issue_num
+            )
             r5 = _docker_run(
                 ["-c", pr_script],
                 entrypoint="bash",
@@ -639,24 +805,50 @@ gh pr create --repo {shlex.quote(repo.full_name)} --title {pr_title_q} --body-fi
             )
             if r5.returncode != 0:
                 logger.error("PR creation failed: %s", r5.stderr or r5.stdout)
+                _notify_progress(
+                    progress,
+                    repo.full_name,
+                    "pr_create",
+                    "failed",
+                    issue=issue_num,
+                    exit_code=r5.returncode,
+                )
                 return False
+            _notify_progress(
+                progress, repo.full_name, "pr_create", "completed", issue=issue_num
+            )
 
             logger.info("PR created for %s issue #%s", repo.full_name, issue_num)
             return True
 
         except subprocess.TimeoutExpired as e:
             logger.error("Timeout processing %s: %s", repo.full_name, e)
+            _notify_progress(progress, repo.full_name, "workflow", "failed", detail="timeout")
             if attempt < max_retries - 1:
                 continue
             return False
         except RuntimeError as e:
             logger.error("Runtime error for %s: %s", repo.full_name, e)
+            _notify_progress(
+                progress,
+                repo.full_name,
+                "workflow",
+                "failed",
+                detail=str(e)[:300],
+            )
             if attempt < max_retries - 1:
                 continue
             return False
         except Exception as e:
             logger.exception(
                 "Unexpected error processing %s (attempt %d): %s", repo.full_name, attempt + 1, e
+            )
+            _notify_progress(
+                progress,
+                repo.full_name,
+                "workflow",
+                "failed",
+                detail=f"unexpected:{type(e).__name__}",
             )
             if attempt < max_retries - 1:
                 continue
@@ -679,6 +871,9 @@ def main() -> None:
 
     WORKSPACE.mkdir(parents=True, exist_ok=True)
 
+    run_id = uuid.uuid4().hex[:12]
+    pw = progress_writer_from_env(run_id=run_id, project_root=PROJECT_ROOT)
+
     token = os.environ.get("GITHUB_TOKEN")
     explicit, issue_override = resolve_target_repo_from_env_or_argv(token)
     if explicit is not None:
@@ -691,20 +886,59 @@ def main() -> None:
             )
         else:
             logger.info("Explicit target %s; skipping discovery", repo.full_name)
-        success_count = 1 if run_one_repo(repo, issue_override=issue_override) else 0
+        _notify_progress(pw, repo.full_name, "target_resolve", "completed")
+        success_count = (
+            1 if run_one_repo(repo, issue_override=issue_override, progress=pw) else 0
+        )
         logger.info("Done. %d PR(s) created.", success_count)
+        _notify_progress(
+            pw,
+            None,
+            "run_complete",
+            "completed",
+            detail="pr_created" if success_count else "no_pr",
+            exit_code=0 if success_count else 2,
+        )
+        if success_count == 0:
+            sys.exit(2)
         return
 
     repos = discover_repos_for_run(token=token)
+    _notify_progress(
+        pw,
+        None,
+        "discovery",
+        "completed",
+        detail=str(len(repos)),
+    )
     logger.info("Discovered %d repo(s) after filters", len(repos))
     if not repos:
+        _notify_progress(pw, None, "discovery", "skipped", detail="no_repos")
         logger.info("No qualifying repositories; nothing to do.")
-        return
+        _notify_progress(
+            pw,
+            None,
+            "run_complete",
+            "completed",
+            detail="no_pr",
+            exit_code=2,
+        )
+        sys.exit(2)
 
     repo = repos[0]
     logger.info("Selected %s (first of %d qualifying)", repo.full_name, len(repos))
-    success_count = 1 if run_one_repo(repo) else 0
+    success_count = 1 if run_one_repo(repo, progress=pw) else 0
     logger.info("Done. %d PR(s) created.", success_count)
+    _notify_progress(
+        pw,
+        repo.full_name,
+        "run_complete",
+        "completed",
+        detail="pr_created" if success_count else "no_pr",
+        exit_code=0 if success_count else 2,
+    )
+    if success_count == 0:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

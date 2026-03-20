@@ -1,4 +1,5 @@
 workspace/
+.iynx-run-progress.jsonl
 .env
 *.pyc
 __pycache__/

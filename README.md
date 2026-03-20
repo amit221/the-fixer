@@ -89,12 +89,45 @@ python run.py obra/superpowers 849
 # Or: IYNX_TARGET_REPO=obra/superpowers IYNX_TARGET_ISSUE=849 python run.py
 ```
 
+### Progress for supervising agents
+
+While `python run.py` runs, the orchestrator writes **structured lifecycle events** so another process (or a Cursor agent watching the repo) can tell what finished or failed without parsing Docker prose.
+
+- **Default file:** `.iynx-run-progress.jsonl` at the project root (gitignored). Each line is one JSON object (`ts`, `run_id`, `phase`, `status`, `repo`, `issue`, `detail`, `exit_code`).
+- **Human logs:** Lines like `[iynx] phase=phase3_implement status=started repo=owner/name issue=42` mirror the same steps in the console.
+- **Override path:** set `IYNX_PROGRESS_JSONL` to a file path. Set it to empty, `0`, or `false` to disable file output (logs still include `[iynx]` lines).
+
+**Follow the log (PowerShell):** `Get-Content .iynx-run-progress.jsonl -Wait`  
+**Follow the log (Unix):** `tail -f .iynx-run-progress.jsonl`
+
+| `phase` | Meaning |
+|---------|---------|
+| `discovery` | Repo list after filters (or skipped if none) |
+| `target_resolve` | Explicit `owner/repo` from argv/env |
+| `preflight` | Open-issue checks before clone |
+| `clone` / `bootstrap` | Docker clone and host bootstrap |
+| `phase1_context` … `phase4_pr_draft` | Cursor phases |
+| `verify_tests` | Optional post-fix test re-run (`skipped` if disabled in orchestrator) |
+| `pr_create` | `gh` fork / push / `pr create` |
+| `workflow` | Host/Docker timeout or unexpected error |
+| `run_complete` | Final row: `detail` is `pr_created` or `no_pr`; `exit_code` matches process |
+
+| `status` | Meaning |
+|---------|---------|
+| `started` | Step began |
+| `completed` | Step succeeded |
+| `failed` | Step failed |
+| `skipped` | Step not applicable (e.g. no repos, verify disabled) |
+
+**Process exit codes:** `0` = PR created; `1` = fatal config (e.g. missing `CURSOR_API_KEY`); `2` = run finished without a PR (discovery empty, preflight/phase/PR failure, etc.).
+
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `CURSOR_API_KEY` | Yes | Cursor CLI API key |
 | `GITHUB_TOKEN` | Yes* | GitHub token (repo scope) for discovery and PRs |
+| `IYNX_PROGRESS_JSONL` | No | Path to JSONL progress file; empty/`0`/`false` disables the file |
 
 Discovery rules (stars, age, pool size, CONTRIBUTING requirement, Cursor model, optional post-fix test re-run) live as **constants** in `src/orchestrator.py` — edit there to tune behavior.
 
@@ -111,6 +144,7 @@ iynx/
 │   ├── discovery.py     # GitHub Search API
 │   ├── github_repo_checks.py  # CONTRIBUTING + author PR checks
 │   ├── bootstrap.py    # Generate .cursor-agent per repo
+│   ├── workflow_progress.py  # JSONL progress for agents
 │   └── pr.py           # Fork + push + gh pr create
 ├── skills/
 │   └── issue-fix-workflow.md
