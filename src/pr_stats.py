@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import time
 from collections import defaultdict
@@ -213,6 +214,7 @@ class Counts:
 class StatsResult:
     author: str
     label: str
+    branch_pattern: str
     branch_pattern_source: str
     counts: Counts
     by_repo: dict[str, Counts]
@@ -297,6 +299,7 @@ def compute_stats(
     return StatsResult(
         author=author,
         label=label,
+        branch_pattern=branch_re.pattern,
         branch_pattern_source=branch_pattern_source,
         counts=totals,
         by_repo=dict(by_repo),
@@ -340,15 +343,35 @@ def render_table(result: StatsResult, *, use_color: bool) -> str:
     return "\n".join(lines)
 
 
-def render_card(result: StatsResult, *, use_color: bool, width: int = 48) -> str:
+def _trunc(s: str, max_len: int) -> str:
+    if len(s) <= max_len:
+        return s
+    if max_len <= 1:
+        return "…"
+    return s[: max_len - 1] + "…"
+
+
+def render_card(result: StatsResult, *, use_color: bool, width: int | None = None) -> str:
+    """Box-drawn card; width follows terminal (or ~56) so stats are not truncated."""
+    try:
+        term_cols = shutil.get_terminal_size().columns
+    except OSError:
+        term_cols = 80
+    if width is None:
+        width = min(max(term_cols, 52), 72)
+    inner_w = max(width - 4, 44)
     c = result.counts
     title = "iynx · PR stats"
-    sub = f"label={result.label} · branch regex ({result.branch_pattern_source})"
-    row = f"Merged {c.merged:>4}  Open {c.open:>4}  Closed {c.closed_unmerged:>4}  Total {c.total:>4}"
-    inner_w = max(width - 4, 36)
-    lines = [title[:inner_w], sub[: inner_w + 10], "", row[:inner_w]]
-    top = "╭" + "─" * (inner_w) + "╮"
-    bot = "╰" + "─" * (inner_w) + "╯"
+    label_line = _trunc(f"label: {result.label}", inner_w)
+    branch_line = _trunc(
+        f"branch: {result.branch_pattern} ({result.branch_pattern_source})",
+        inner_w,
+    )
+    hdr = f"{'merged':>7}  {'open':>6}  {'unmerged':>8}  {'total':>6}"
+    row = f"{c.merged:>7}  {c.open:>6}  {c.closed_unmerged:>8}  {c.total:>6}"
+    lines = [title, label_line, branch_line, "", hdr, row]
+    top = "╭" + "─" * inner_w + "╮"
+    bot = "╰" + "─" * inner_w + "╯"
     body = []
     for line in lines:
         pad = inner_w - len(line)

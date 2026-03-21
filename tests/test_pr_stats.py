@@ -60,6 +60,7 @@ def test_bucket_counts() -> None:
     result = pr_stats.StatsResult(
         author="a",
         label="l",
+        branch_pattern=pr_stats.DEFAULT_BRANCH_REGEX,
         branch_pattern_source="default",
         counts=pr_stats.Counts(),
         by_repo={},
@@ -132,6 +133,7 @@ def test_result_to_json_omits_empty_by_repo() -> None:
     r = pr_stats.StatsResult(
         author="a",
         label="l",
+        branch_pattern=r"^fix/issue-\d+$",
         branch_pattern_source="default",
         counts=pr_stats.Counts(),
         by_repo={},
