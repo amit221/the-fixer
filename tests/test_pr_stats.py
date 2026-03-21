@@ -23,6 +23,12 @@ def test_build_search_q() -> None:
     assert "label:iynx" in q
 
 
+def test_build_search_q_without_label() -> None:
+    q = pr_stats._build_search_q("open", "octocat", None)
+    assert "label:" not in q
+    assert "author:octocat" in q
+
+
 def test_repo_from_repository_url() -> None:
     assert pr_stats._repo_from_repository_url(
         "https://api.github.com/repos/foo/bar"
@@ -42,22 +48,26 @@ def test_repo_from_issue_item_fallbacks() -> None:
 def test_resolve_label_cli_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("IYNX_STATS_LABEL", raising=False)
     monkeypatch.delenv("IYNX_PR_LABEL", raising=False)
-    assert pr_stats.resolve_label("from-cli") == "from-cli"
+    assert pr_stats.resolve_label("from-cli", no_label=False) == "from-cli"
 
 
 def test_resolve_label_env_chain(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("IYNX_STATS_LABEL", "stats-l")
     monkeypatch.setenv("IYNX_PR_LABEL", "pr-l")
-    assert pr_stats.resolve_label(None) == "stats-l"
+    assert pr_stats.resolve_label(None, no_label=False) == "stats-l"
     monkeypatch.delenv("IYNX_STATS_LABEL", raising=False)
-    assert pr_stats.resolve_label(None) == "pr-l"
+    assert pr_stats.resolve_label(None, no_label=False) == "pr-l"
 
 
 def test_resolve_label_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("IYNX_STATS_LABEL", raising=False)
     monkeypatch.delenv("IYNX_PR_LABEL", raising=False)
     with pytest.raises(ValueError):
-        pr_stats.resolve_label(None)
+        pr_stats.resolve_label(None, no_label=False)
+
+
+def test_resolve_label_no_label() -> None:
+    assert pr_stats.resolve_label(None, no_label=True) is None
 
 
 def test_resolve_branch_regex() -> None:

@@ -39,10 +39,13 @@ def _format_label_for_query(label: str) -> str:
     return label
 
 
-def _build_search_q(state: str, author: str, label: str) -> str:
-    """state is 'open' or 'closed'."""
+def _build_search_q(state: str, author: str, label: str | None) -> str:
+    """state is 'open' or 'closed'. If label is None, search by author only (no label:)."""
+    base = f"is:pr is:{state} author:{author}"
+    if not label:
+        return base
     lt = _format_label_for_query(label)
-    return f"is:pr is:{state} author:{author} label:{lt}"
+    return f"{base} label:{lt}"
 
 
 def _repo_from_repository_url(url: str) -> tuple[str, str]:
@@ -198,7 +201,13 @@ def fetch_pull(
     return r.json()
 
 
-def resolve_label(cli_label: str | None) -> str:
+def resolve_label(cli_label: str | None, *, no_label: bool) -> str | None:
+    """
+    Label for GitHub Search. If ``no_label`` is True, do not filter by label (branch regex only).
+    Otherwise require --label or IYNX_STATS_LABEL / IYNX_PR_LABEL.
+    """
+    if no_label:
+        return None
     raw_stats = os.environ.get("IYNX_STATS_LABEL")
     raw_pr = os.environ.get("IYNX_PR_LABEL")
     if cli_label and cli_label.strip():
@@ -208,8 +217,14 @@ def resolve_label(cli_label: str | None) -> str:
     if raw_pr and str(raw_pr).strip():
         return str(raw_pr).strip()
     raise ValueError(
-        "Set IYNX_STATS_LABEL or IYNX_PR_LABEL, or pass --label (empty counts as unset)."
+        "Set IYNX_STATS_LABEL or IYNX_PR_LABEL, pass --label, or use --no-label "
+        "to match PRs by author + branch only (no label in search)."
     )
+
+
+def no_label_from_env() -> bool:
+    v = os.environ.get("IYNX_STATS_NO_LABEL", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def resolve_branch_regex(cli_regex: str | None) -> tuple[re.Pattern[str], str]:
@@ -241,7 +256,7 @@ class Counts:
 @dataclass
 class StatsResult:
     author: str
-    label: str
+    label: str | None
     branch_pattern: str
     branch_pattern_source: str
     counts: Counts
@@ -252,7 +267,7 @@ class StatsResult:
 def compute_stats(
     *,
     token: str,
-    label: str,
+    label: str | None,
     branch_re: re.Pattern[str],
     branch_pattern_source: str,
     author: str,
@@ -344,6 +359,7 @@ def compute_stats(
             "user_capped": user_capped,
             "skipped_no_repo": skipped_no_repo,
             "skipped_branch_mismatch": skipped_branch_mismatch,
+            "label_filter": label is not None,
         },
     )
 
@@ -362,8 +378,9 @@ def _ansi(code: str) -> str:
 
 def render_table(result: StatsResult, *, use_color: bool) -> str:
     c = result.counts
+    lab = result.label if result.label is not None else "(no label filter)"
     lines = [
-        f"author={result.author} label={result.label} branch_source={result.branch_pattern_source}",
+        f"author={result.author} label={lab} branch_source={result.branch_pattern_source}",
         "",
         f"{'merged':>8} {'open':>8} {'closed_u':>8} {'total':>8}",
         f"{c.merged:>8} {c.open:>8} {c.closed_unmerged:>8} {c.total:>8}",
@@ -398,7 +415,8 @@ def render_card(result: StatsResult, *, use_color: bool, width: int | None = Non
     inner_w = max(width - 4, 44)
     c = result.counts
     title = "iynx · PR stats"
-    label_line = _trunc(f"label: {result.label}", inner_w)
+    lab_disp = result.label if result.label is not None else "(none — author+branch only)"
+    label_line = _trunc(f"label: {lab_disp}", inner_w)
     branch_line = _trunc(
         f"branch: {result.branch_pattern} ({result.branch_pattern_source})",
         inner_w,
@@ -463,21 +481,39 @@ def _emit_diagnostics(result: StatsResult, *, verbose: bool) -> None:
     sbm = int(lim.get("skipped_branch_mismatch") or 0)
     snr = int(lim.get("skipped_no_repo") or 0)
     if st == 0:
-        print(
-            "hint: GitHub search found no PRs for this author + label. "
-            "Confirm each PR has the label "
-            f"{result.label!r} (exact spelling), and that the token user "
-            f"({result.author}) is the PR author. Use --author LOGIN if needed.",
-            file=sys.stderr,
-        )
+        if result.label is None:
+            print(
+                "hint: GitHub search found no PRs for this author (no label filter). "
+                f"Confirm the token user ({result.author}) opened the PRs. "
+                "Use --author LOGIN if needed.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "hint: GitHub search found no PRs for this author + label. "
+                "Confirm each PR has the label "
+                f"{result.label!r} (exact spelling), and that the token user "
+                f"({result.author}) is the PR author. "
+                "For PRs without labels, try: python stats.py --no-label\n"
+                "Use --author LOGIN if needed.",
+                file=sys.stderr,
+            )
     elif sbm > 0:
-        print(
-            "hint: PRs matched author + label, but none matched the head-branch regex "
-            f"{result.branch_pattern!r}. "
-            "To count by label only (any branch), run:\n"
-            f'  python stats.py --branch-regex ".*" --label {result.label!r}',
-            file=sys.stderr,
-        )
+        if result.label is None:
+            print(
+                "hint: PRs matched author, but none matched the head-branch regex "
+                f"{result.branch_pattern!r}. "
+                'Try: python stats.py --no-label --branch-regex ".*"',
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "hint: PRs matched author + label, but none matched the head-branch regex "
+                f"{result.branch_pattern!r}. "
+                "To count by label only (any branch), run:\n"
+                f'  python stats.py --branch-regex ".*" --label {result.label!r}',
+                file=sys.stderr,
+            )
     elif snr > 0:
         print(
             f"hint: {snr} search hits had no usable repository URL (unexpected). "
@@ -487,7 +523,9 @@ def _emit_diagnostics(result: StatsResult, *, verbose: bool) -> None:
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="GitHub PR statistics (label + branch pattern).")
+    p = argparse.ArgumentParser(
+        description="GitHub PR statistics (optional label + branch pattern).",
+    )
     p.add_argument(
         "--format",
         choices=("json", "table", "card", "share"),
@@ -495,7 +533,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Output format (card and share are the same).",
     )
     p.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
-    p.add_argument("--label", default=None, help="Label filter (overrides env).")
+    lg = p.add_mutually_exclusive_group()
+    lg.add_argument(
+        "--label",
+        default=None,
+        metavar="NAME",
+        help="Label filter (overrides env).",
+    )
+    lg.add_argument(
+        "--no-label",
+        action="store_true",
+        help="Do not filter by label in GitHub search (author + branch regex only). "
+        "Use for PRs that have fix branches but no label.",
+    )
     p.add_argument("--branch-regex", default=None, help="Head branch regex (overrides env).")
     p.add_argument("--author", default=None, help="PR author login (overrides env / API).")
     p.add_argument(
@@ -521,7 +571,8 @@ def run(argv: list[str] | None = None) -> int:
         print("GITHUB_TOKEN is required.", file=sys.stderr)
         return 1
     try:
-        label = resolve_label(args.label)
+        no_lab = bool(args.no_label) or no_label_from_env()
+        label = resolve_label(args.label, no_label=no_lab)
         branch_re, branch_src = resolve_branch_regex(args.branch_regex)
         author = resolve_author(args.author, str(token).strip())
     except ValueError as e:

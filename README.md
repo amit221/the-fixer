@@ -137,18 +137,21 @@ While `python run.py` runs, the orchestrator writes **structured lifecycle event
 
 ### PR statistics (GitHub)
 
-Count your PRs that match a **label** and a **head branch** regex (default `fix/issue-<n>`), across all repositories, using the GitHub API. Requires `GITHUB_TOKEN` and a label from `--label`, `IYNX_STATS_LABEL`, or `IYNX_PR_LABEL`.
+Count your PRs that match an **optional label** and a **head branch** regex (default `fix/issue-<n>`), across all repositories, using the GitHub API. Requires `GITHUB_TOKEN`. A label comes from `--label`, `IYNX_STATS_LABEL`, or `IYNX_PR_LABEL`—or use **`--no-label`** to match **author + branch only** (for PRs that never had a label).
 
 ```bash
-# JSON (stable schema_version) or a terminal card (good for screenshots)
+# With label (filter in GitHub search)
 python stats.py --format json --label your-label
 python stats.py --format card --label your-label
+
+# No label: only author + branch head (e.g. fix/issue-123 branches without the label)
+python stats.py --no-label
 # alias: --format share
 ```
 
-Use **`IYNX_PR_LABEL`** when running the agent so new PRs get the same label and show up in these stats. GitHub Search returns at most **1,000** items per open/closed query; if you have more matches, counts can be incomplete (a warning is printed). Private repos need a token with **`repo`** scope.
+Use **`IYNX_PR_LABEL`** when running the agent so new PRs get the same label and show up in label-based stats. GitHub Search returns at most **1,000** items per open/closed query; if you have more matches, counts can be incomplete (a warning is printed). Private repos need a token with **`repo`** scope.
 
-**If counts stay at zero:** (1) PRs must have the **exact** label you filter on—older PRs opened before `IYNX_PR_LABEL` was set won’t have it. (2) By default only head branches matching **`^fix/issue-\d+$`** count; use **`python stats.py --branch-regex ".*"`** to include any branch, or **`python stats.py -v`** for search/skip diagnostics on stderr.
+**If counts stay at zero:** (1) With a label filter, PRs must have that **exact** label—older PRs opened before `IYNX_PR_LABEL` was set won’t have it; use **`--no-label`** instead. (2) By default only head branches matching **`^fix/issue-\d+$`** count; use **`python stats.py --branch-regex ".*"`** to include any branch, or **`python stats.py -v`** for search/skip diagnostics on stderr.
 
 **Exit codes:** `0` success; `1` config/usage; `2` GitHub HTTP/network error after retries.
 
@@ -160,6 +163,7 @@ Use **`IYNX_PR_LABEL`** when running the agent so new PRs get the same label and
 | `GITHUB_TOKEN` | Yes* | GitHub token (repo scope) for discovery and PRs |
 | `IYNX_PR_LABEL` | No | If set, passed to `gh pr create --label` so PRs are tagged for `stats.py` filtering |
 | `IYNX_STATS_LABEL` | No | Override label when running `python stats.py` (defaults to `IYNX_PR_LABEL`) |
+| `IYNX_STATS_NO_LABEL` | No | If `1`/`true`, same as `python stats.py --no-label` (author + branch only; no label in search) |
 | `IYNX_STATS_BRANCH_REGEX` | No | Override branch regex for `stats.py` (default matches `fix/issue-<n>`) |
 | `IYNX_STATS_AUTHOR` | No | GitHub login for `stats.py` (default: token’s user) |
 | `IYNX_PROGRESS_JSONL` | No | Path to JSONL progress file; empty/`0`/`false` disables the file |
