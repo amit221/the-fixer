@@ -67,7 +67,7 @@ Local `.iynx-run-progress.jsonl` aggregates are **out of scope** for this featur
 | `--label` | Override label (else env chain above). |
 | `--branch-regex` | Override branch regex. |
 | `--author` | Override author login. |
-| `--max` | Optional safety cap on items processed (pagination stop); document default (e.g. none or high ceiling). |
+| `--max` | Optional cap on **search items fetched** (stop pagination early). Sets `limits.user_capped` when the cap bites before the fetchable set is exhausted. Default: no cap. |
 
 **Exit codes:** `0` success; `1` configuration or usage error; `2` GitHub API error after retries (optional distinction; document).
 
@@ -93,7 +93,8 @@ Stable fields (semver: additive only until v2):
   "limits": {
     "search_total_count": 0,
     "search_items_fetched": 0,
-    "search_truncated": false
+    "search_truncated": false,
+    "user_capped": false
   }
 }
 ```
@@ -101,8 +102,9 @@ Stable fields (semver: additive only until v2):
 - **`branch_pattern_source`:** Where the branch regex came from: **`default`** (built-in `^fix/issue-\d+$`), **`env`** (`IYNX_STATS_BRANCH_REGEX`), or **`cli`** (`--branch-regex`).
 - **`by_repo`:** Omit or `{}` when empty; include when non-empty.
 - **`limits.search_total_count`:** The **`total_count`** field from the first Search API response (total matches for the query on GitHub, may exceed what can be retrieved).
-- **`limits.search_items_fetched`:** Number of **search result items actually retrieved** from the API across all pages (each item is a PR candidate **before** head-ref regex filtering). Maximum **1,000** (GitHub’s per-query retrieval cap).
+- **`limits.search_items_fetched`:** Number of **search result items actually retrieved** from the API across all pages (each item is a PR candidate **before** head-ref regex filtering). Maximum **1,000** (GitHub’s per-query retrieval cap), or fewer if **`--max`** stops pagination early.
 - **`limits.search_truncated`:** Set `true` **iff** `search_total_count` **>** `1,000` (GitHub will not return more than 1,000 items; counts may omit older PRs). Set `false` when `search_total_count` ≤ 1,000 (all matching search hits were fetchable). Emit a **warning** on stderr for all formats when `true`; document in README.
+- **`limits.user_capped`:** Set `true` **iff** pagination stopped because **`--max`** was reached before exhausting fetchable search items. Emit an **informational** message on stderr (distinct from the GitHub truncation warning). When `false`, either all fetchable items were read or GitHub returned fewer than `--max` items total.
 
 ---
 
@@ -111,17 +113,19 @@ Stable fields (semver: additive only until v2):
 1. **Resolve author login:** `GET /user` unless `--author` / `IYNX_STATS_AUTHOR` is set.
 2. **Search:** `GET /search/issues` with query  
    `is:pr author:<login> label:<label>`  
+   **States:** Results must include **open and closed** PRs so merged / open / closed-unmerged counts are possible. **Spike in implementation:** confirm whether the default search scope is open-only; if so, extend `q` (e.g. `is:open OR is:closed` with `is:pr`) or run **two** searches (`is:pr is:open …` and `is:pr is:closed …`) and **merge/deduplicate** by PR identity before filtering.  
+   Use explicit **`sort`** and **`order`** query parameters (e.g. `sort=updated`, `order=desc`) so pagination order is stable across requests; document the chosen values in the implementation plan.  
    Paginate (`per_page` 100, follow `Link` header until done or `--max`).
 
    **GitHub Search hard cap:** At most **1,000** **items** can be **retrieved** per query, even if `total_count` is higher. Store `search_total_count` from the API and set `search_truncated` to **true** when `total_count` **>** 1,000. When `total_count` is **≤** 1,000, all matching search items are retrievable (`search_truncated` is **false**). Paginate until all fetchable items are read (or `--max` stops early). Apply head-ref regex **after** fetching. v1 does **not** require sharding queries (e.g. by date or repo); document as a known limitation and optional future `--since` or split strategies.
-3. **Enrich:** Search results may not always include full head ref detail in one payload. For each candidate, use **`GET /repos/{owner}/{repo}/pulls/{pull_number}`** or pull from search item if `pull_request` + head ref is reliably present — **implementation plan** should pick one path and document; requirement is **correct head ref** for filtering.
+3. **Enrich (head ref):** For each search item, if the payload already includes the **head branch name** needed for regex matching (see GitHub REST “Issues” search item shape: `pull_request` URL and/or repository linkage), use it. **Otherwise** call **`GET /repos/{owner}/{repo}/pulls/{pull_number}`** once for that item. **Decision rule:** After a one-time spike against live API responses in the plan, lock “field present → no GET; else GET” in code comments and tests. Requirement: **correct head ref** for filtering.
 4. **Filter:** Keep items whose **head ref** `ref` (branch name) matches `IYNX_STATS_BRANCH_REGEX`.
 5. **Bucket:**
    - `merged` — `merged_at` is non-null.
    - `open` — `state == open`.
    - `closed` (unmerged) — `state == closed` and `merged_at` is null.
 
-**Rate limits:** Search API has low quotas. Implement **pagination** only in v1; on `403` with rate limit or `Retry-After`, sleep and retry (bounded attempts). Document that very large histories may need a **future** `--since` date filter (YAGNI for v1 unless review flags it).
+**Rate limits:** Search API has low quotas. Implement **pagination** only in v1. On **rate limiting**, follow GitHub’s signals: prefer **`429`** with `Retry-After` when present; handle **`403`** with abuse/rate-limit secondary limits per [GitHub docs](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api). Sleep and retry with bounded attempts. Document that very large histories may need a **future** `--since` date filter (YAGNI for v1 unless review flags it).
 
 ---
 
@@ -152,4 +156,4 @@ Stable fields (semver: additive only until v2):
 ## Open points for implementation plan only
 
 - Exact package/module layout and console script name (`python -m …`).
-- Whether search items always include enough head ref data or every item needs a follow-up GET (verify against GitHub API response shape in implementation).
+- Spike: confirm which fields on `/search/issues` items carry head ref; lock the enrich rule from section 3 accordingly.
