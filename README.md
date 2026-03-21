@@ -148,6 +148,8 @@ python stats.py --format card --label your-label
 
 Use **`IYNX_PR_LABEL`** when running the agent so new PRs get the same label and show up in these stats. GitHub Search returns at most **1,000** items per open/closed query; if you have more matches, counts can be incomplete (a warning is printed). Private repos need a token with **`repo`** scope.
 
+**If counts stay at zero:** (1) PRs must have the **exact** label you filter on—older PRs opened before `IYNX_PR_LABEL` was set won’t have it. (2) By default only head branches matching **`^fix/issue-\d+$`** count; use **`python stats.py --branch-regex ".*"`** to include any branch, or **`python stats.py -v`** for search/skip diagnostics on stderr.
+
 **Exit codes:** `0` success; `1` config/usage; `2` GitHub HTTP/network error after retries.
 
 ## Environment Variables

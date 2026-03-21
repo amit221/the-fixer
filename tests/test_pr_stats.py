@@ -29,6 +29,16 @@ def test_repo_from_repository_url() -> None:
     ) == ("foo", "bar")
 
 
+def test_repo_from_issue_item_fallbacks() -> None:
+    assert pr_stats._repo_from_issue_item(
+        {"number": 1, "html_url": "https://github.com/foo/bar/pull/99"}
+    ) == ("foo", "bar")
+    assert pr_stats._repo_from_issue_item(
+        {"number": 1, "repository": {"full_name": "a/b"}}
+    ) == ("a", "b")
+    assert pr_stats._repo_from_issue_item({"number": 1}) is None
+
+
 def test_resolve_label_cli_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("IYNX_STATS_LABEL", raising=False)
     monkeypatch.delenv("IYNX_PR_LABEL", raising=False)

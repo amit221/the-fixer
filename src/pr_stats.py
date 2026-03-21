@@ -50,6 +50,34 @@ def _repo_from_repository_url(url: str) -> tuple[str, str]:
     return parts[-2], parts[-1]
 
 
+def _repo_from_issue_item(item: dict[str, Any]) -> tuple[str, str] | None:
+    """
+    Search `/search/issues` items usually include `repository_url`; some payloads
+    only expose `repository` or `html_url` — resolve owner/repo for GET /pulls.
+    """
+    url = item.get("repository_url")
+    if isinstance(url, str) and url.strip():
+        try:
+            return _repo_from_repository_url(url)
+        except (IndexError, ValueError):
+            pass
+
+    repo = item.get("repository")
+    if isinstance(repo, dict):
+        fn = repo.get("full_name")
+        if isinstance(fn, str) and "/" in fn:
+            owner, _, name = fn.partition("/")
+            if owner and name:
+                return owner, name
+
+    html = item.get("html_url")
+    if isinstance(html, str):
+        m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/(?:pull|issues)/", html)
+        if m:
+            return m.group(1), m.group(2)
+    return None
+
+
 def _api_headers(token: str) -> dict[str, str]:
     return {
         "Accept": "application/vnd.github.v3+json",
@@ -257,12 +285,15 @@ def compute_stats(
 
     kept: list[tuple[str, dict[str, Any]]] = []
     seen: set[tuple[str, str, int]] = set()
+    skipped_no_repo = 0
+    skipped_branch_mismatch = 0
 
     for it in open_items + closed_items:
-        repo_url = it.get("repository_url")
-        if not repo_url or not isinstance(repo_url, str):
+        parsed = _repo_from_issue_item(it)
+        if not parsed:
+            skipped_no_repo += 1
             continue
-        owner, name = _repo_from_repository_url(repo_url)
+        owner, name = parsed
         num = int(it["number"])
         key = (owner, name, num)
         if key in seen:
@@ -274,6 +305,7 @@ def compute_stats(
         if not ref or not isinstance(ref, str):
             continue
         if not branch_re.search(ref):
+            skipped_branch_mismatch += 1
             continue
         kept.append((f"{owner}/{name}", pr))
 
@@ -305,9 +337,13 @@ def compute_stats(
         by_repo=dict(by_repo),
         limits={
             "search_total_count": search_total_count,
+            "search_open_total": open_total,
+            "search_closed_total": closed_total,
             "search_items_fetched": fetched_total,
             "search_truncated": search_truncated,
             "user_capped": user_capped,
+            "skipped_no_repo": skipped_no_repo,
+            "skipped_branch_mismatch": skipped_branch_mismatch,
         },
     )
 
@@ -389,6 +425,7 @@ def result_to_json(result: StatsResult) -> dict[str, Any]:
         "schema_version": 1,
         "author": result.author,
         "label": result.label,
+        "branch_pattern": result.branch_pattern,
         "branch_pattern_source": result.branch_pattern_source,
         "counts": {
             "total": result.counts.total,
@@ -411,6 +448,44 @@ def result_to_json(result: StatsResult) -> dict[str, Any]:
     return out
 
 
+def _emit_diagnostics(result: StatsResult, *, verbose: bool) -> None:
+    lim = result.limits
+    if verbose:
+        print(
+            f"[stats] author={result.author!r} label={result.label!r} "
+            f"branch_regex={result.branch_pattern!r} ({result.branch_pattern_source})",
+            file=sys.stderr,
+        )
+        print(f"[stats] limits={json.dumps(lim, ensure_ascii=False)}", file=sys.stderr)
+    if result.counts.total > 0:
+        return
+    st = int(lim.get("search_total_count") or 0)
+    sbm = int(lim.get("skipped_branch_mismatch") or 0)
+    snr = int(lim.get("skipped_no_repo") or 0)
+    if st == 0:
+        print(
+            "hint: GitHub search found no PRs for this author + label. "
+            "Confirm each PR has the label "
+            f"{result.label!r} (exact spelling), and that the token user "
+            f"({result.author}) is the PR author. Use --author LOGIN if needed.",
+            file=sys.stderr,
+        )
+    elif sbm > 0:
+        print(
+            "hint: PRs matched author + label, but none matched the head-branch regex "
+            f"{result.branch_pattern!r}. "
+            "To count by label only (any branch), run:\n"
+            f'  python stats.py --branch-regex ".*" --label {result.label!r}',
+            file=sys.stderr,
+        )
+    elif snr > 0:
+        print(
+            f"hint: {snr} search hits had no usable repository URL (unexpected). "
+            "Try again with --verbose and report an issue.",
+            file=sys.stderr,
+        )
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="GitHub PR statistics (label + branch pattern).")
     p.add_argument(
@@ -429,6 +504,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         metavar="N",
         help="Max search items to fetch (open then closed).",
+    )
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print search diagnostics to stderr (counts, skips, hints).",
     )
     return p.parse_args(argv)
 
@@ -478,6 +559,8 @@ def run(argv: list[str] | None = None) -> int:
             "info: stopped early due to --max before exhausting matching search results.",
             file=sys.stderr,
         )
+
+    _emit_diagnostics(result, verbose=args.verbose)
 
     use_color = _use_color(args.no_color)
     fmt = args.format
